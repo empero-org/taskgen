@@ -180,6 +180,13 @@ struct Args {
     dedup_threshold: f64,
 
     #[arg(long)]
+    free_models: bool,
+
+    /// Rescan interval in minutes for free model availability (default: 10)
+    #[arg(long, default_value_t = 10)]
+    free_rescan: u64,
+
+    #[arg(long)]
     input_price: Option<f64>,
 
     #[arg(long)]
@@ -229,6 +236,36 @@ struct Usage {
 #[derive(Debug, Deserialize)]
 struct Choice {
     message: ChatMessage,
+}
+
+const MAX_MODEL_FAILURES: usize = 3;
+
+struct ModelFailures {
+    counts: std::sync::Mutex<HashMap<String, usize>>,
+    rescan_notify: tokio::sync::Notify,
+}
+
+impl ModelFailures {
+    fn new() -> Self {
+        Self {
+            counts: std::sync::Mutex::new(HashMap::new()),
+            rescan_notify: tokio::sync::Notify::new(),
+        }
+    }
+
+    /// Record a failure. Returns true if the model just crossed the threshold.
+    fn record(&self, model: &str) -> bool {
+        let mut counts = self.counts.lock().unwrap();
+        let count = counts.entry(model.to_string()).or_insert(0);
+        *count += 1;
+        *count == MAX_MODEL_FAILURES
+    }
+
+    /// Remove a model from tracking (called after rescan replaces the list).
+    fn reset(&self) {
+        let mut counts = self.counts.lock().unwrap();
+        counts.clear();
+    }
 }
 
 struct AtomicStats {
@@ -373,6 +410,148 @@ fn load_api_keys(path: &PathBuf) -> Result<Vec<String>> {
         bail!("keyfile is empty: {}", path.display());
     }
     Ok(keys)
+}
+
+const OPENROUTER_API_BASE: &str = "https://openrouter.ai/api/v1";
+const MIN_FREE_MODEL_CTX: u64 = 16000;
+
+#[derive(Debug, Deserialize)]
+struct ModelsResponse {
+    data: Vec<ModelEntry>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ModelEntry {
+    id: String,
+    name: String,
+    architecture: ModelArchitecture,
+    pricing: ModelPricing,
+    top_provider: ModelProvider,
+}
+
+#[derive(Debug, Deserialize)]
+struct ModelArchitecture {
+    input_modalities: Vec<String>,
+    output_modalities: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ModelPricing {
+    prompt: String,
+    completion: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ModelProvider {
+    context_length: Option<u64>,
+    max_completion_tokens: Option<u64>,
+}
+
+async fn fetch_free_models(client: &reqwest::Client, api_key: &str) -> Result<Vec<String>> {
+    let url = format!("{}/models", OPENROUTER_API_BASE);
+    let resp = client
+        .get(&url)
+        .header("Authorization", format!("Bearer {}", api_key))
+        .send()
+        .await
+        .context("failed to fetch OpenRouter models")?;
+
+    if !resp.status().is_success() {
+        let text = resp.text().await.unwrap_or_default();
+        bail!("OpenRouter models API error: {}", text);
+    }
+
+    let models: ModelsResponse = resp.json().await.context("failed to parse models response")?;
+
+    let mut free: Vec<(String, String, u64)> = models
+        .data
+        .into_iter()
+        .filter(|m| {
+            m.pricing.prompt == "0"
+                && m.pricing.completion == "0"
+                && m.architecture.input_modalities.contains(&"text".to_string())
+                && m.architecture.output_modalities.contains(&"text".to_string())
+                && m.id != "openrouter/free"
+                && m.top_provider.context_length.unwrap_or(0) >= MIN_FREE_MODEL_CTX
+        })
+        .map(|m| {
+            let ctx = m.top_provider.context_length.unwrap_or(0);
+            (m.id, m.name, ctx)
+        })
+        .collect();
+
+    // sort by context length descending so best models are first
+    free.sort_by(|a, b| b.2.cmp(&a.2));
+
+    if free.is_empty() {
+        bail!("no free models with >= {}k context available on OpenRouter right now", MIN_FREE_MODEL_CTX / 1000);
+    }
+
+    println!("Found {} candidate free models, running health checks...", free.len());
+
+    // ping each model with a tiny request to verify it's actually online
+    let mut verified: Vec<String> = Vec::new();
+    for (id, name, ctx) in &free {
+        print!("  testing {} ({}, {}k ctx)... ", id, name, ctx / 1000);
+        match test_model(client, api_key, id).await {
+            Ok(()) => {
+                println!("ok");
+                verified.push(id.clone());
+            }
+            Err(e) => {
+                println!("offline ({})", e);
+            }
+        }
+    }
+
+    if verified.is_empty() {
+        bail!("all free models are offline on OpenRouter right now");
+    }
+
+    println!("Using {} verified free models", verified.len());
+    Ok(verified)
+}
+
+async fn test_model(client: &reqwest::Client, api_key: &str, model: &str) -> Result<()> {
+    let body = ChatRequest {
+        model: model.to_string(),
+        messages: vec![ChatMessage {
+            role: "user".into(),
+            content: "Say hi.".into(),
+        }],
+        temperature: 0.0,
+        max_tokens: Some(5),
+    };
+
+    let url = format!("{}/chat/completions", OPENROUTER_API_BASE);
+    let resp = client
+        .post(&url)
+        .header("Authorization", format!("Bearer {}", api_key))
+        .header("Content-Type", "application/json")
+        .json(&body)
+        .timeout(std::time::Duration::from_secs(15))
+        .send()
+        .await
+        .context("request failed")?;
+
+    let status = resp.status();
+
+    // 429 means the model exists and is live, just rate limited — count as available
+    if status.as_u16() == 429 {
+        return Ok(());
+    }
+
+    if !status.is_success() {
+        let text = resp.text().await.unwrap_or_default();
+        bail!("{}: {}", status, &text[..text.len().min(100)]);
+    }
+
+    let chat_resp: ChatResponse = resp.json().await.context("bad response")?;
+    if chat_resp.choices.is_empty() {
+        bail!("no choices returned");
+    }
+
+    Ok(())
 }
 
 fn build_domain_pool(dist: &HashMap<String, f64>) -> Vec<(String, String, String, f64)> {
@@ -711,6 +890,24 @@ async fn main() -> Result<()> {
     });
     let key_counter = Arc::new(AtomicUsize::new(0));
 
+    // discover free models from OpenRouter if requested
+    let api_base = if args.free_models {
+        OPENROUTER_API_BASE.to_string()
+    } else {
+        args.api_base.clone()
+    };
+
+    let model_failures = Arc::new(ModelFailures::new());
+
+    let free_model_list: Option<Arc<tokio::sync::RwLock<Vec<String>>>> = if args.free_models {
+        let discovery_client = reqwest::Client::new();
+        let models = fetch_free_models(&discovery_client, &api_keys[0]).await?;
+        Some(Arc::new(tokio::sync::RwLock::new(models)))
+    } else {
+        None
+    };
+    let model_counter = Arc::new(AtomicUsize::new(0));
+
     let dist: HashMap<String, f64> = match &args.distribution {
         Some(d) => parse_distribution(d)?,
         None => DEFAULT_DISTRIBUTION.iter().map(|(k, v)| (k.to_string(), *v)).collect(),
@@ -790,6 +987,44 @@ async fn main() -> Result<()> {
     );
     pb.set_message("starting...");
 
+    // spawn background rescan task for free models
+    let rescan_handle = if let Some(ref model_list) = free_model_list {
+        let model_list = model_list.clone();
+        let cancel = cancel.clone();
+        let model_failures = model_failures.clone();
+        let api_key = api_keys[0].clone();
+        let rescan_mins = args.free_rescan;
+        let pb = pb.clone();
+        Some(tokio::spawn(async move {
+            let client = reqwest::Client::new();
+            loop {
+                // wait for either the timer or an immediate rescan trigger
+                tokio::select! {
+                    _ = tokio::time::sleep(tokio::time::Duration::from_secs(rescan_mins * 60)) => {},
+                    _ = model_failures.rescan_notify.notified() => {},
+                }
+                if cancel.load(Ordering::Relaxed) {
+                    break;
+                }
+                pb.suspend(|| println!("[RESCAN] refreshing free model list..."));
+                match fetch_free_models(&client, &api_key).await {
+                    Ok(new_models) => {
+                        let count = new_models.len();
+                        model_failures.reset();
+                        let mut list = model_list.write().await;
+                        *list = new_models;
+                        pb.suspend(|| println!("[RESCAN] updated: {} models available", count));
+                    }
+                    Err(e) => {
+                        pb.suspend(|| eprintln!("[RESCAN] failed to refresh: {}, keeping current list", e));
+                    }
+                }
+            }
+        }))
+    } else {
+        None
+    };
+
     stream::iter(0..count)
         .for_each_concurrent(workers, |i| {
             let clients = clients.clone();
@@ -798,10 +1033,13 @@ async fn main() -> Result<()> {
             let stats = stats.clone();
             let cancel = cancel.clone();
             let consecutive_timeouts = consecutive_timeouts.clone();
-            let api_base = args.api_base.clone();
+            let api_base = api_base.clone();
             let api_keys = api_keys.clone();
             let key_counter = key_counter.clone();
             let model = args.model.clone();
+            let free_model_list = free_model_list.clone();
+            let model_counter = model_counter.clone();
+            let model_failures = model_failures.clone();
             let system_prompt = system_prompt.to_string();
             let presampled = presampled.clone();
             let temperature = args.temperature;
@@ -825,6 +1063,15 @@ async fn main() -> Result<()> {
                     }
                 }
 
+                let use_model = match &free_model_list {
+                    Some(models) => {
+                        let list = models.read().await;
+                        let idx = model_counter.fetch_add(1, Ordering::Relaxed) % list.len();
+                        list[idx].clone()
+                    }
+                    None => model.clone(),
+                };
+
                 let domain_display = format!("{}::{}", cat, domain_name);
                 let client_idx = proxy_counter.fetch_add(1, Ordering::Relaxed) % clients.len();
                 let client = &clients[client_idx];
@@ -835,7 +1082,7 @@ async fn main() -> Result<()> {
                     client,
                     &api_base,
                     api_key,
-                    &model,
+                    &use_model,
                     &system_prompt,
                     cat,
                     &domain_display,
@@ -859,7 +1106,7 @@ async fn main() -> Result<()> {
                             domain: format!("{}::{}", cat, domain_name),
                             subdomain: subdomain.clone(),
                             difficulty,
-                            taskgen_model: model.clone(),
+                            taskgen_model: use_model,
                             temperature,
                         };
                         let line = serde_json::to_string(&entry).unwrap() + "\n";
@@ -884,12 +1131,30 @@ async fn main() -> Result<()> {
                         if !cancel.load(Ordering::Relaxed) {
                             pb.suspend(|| eprintln!("[ERROR] task {}: {}", i + 1, e));
                         }
+                        // track per-model failures for free model rotation
+                        if free_model_list.is_some() {
+                            let tripped = model_failures.record(&use_model);
+                            if tripped {
+                                pb.suspend(|| {
+                                    eprintln!(
+                                        "[RESCAN] {} failed {} times, marking offline and triggering rescan",
+                                        use_model, MAX_MODEL_FAILURES
+                                    );
+                                });
+                                model_failures.rescan_notify.notify_one();
+                            }
+                        }
                     }
                 }
                 pb.inc(1);
             }
         })
         .await;
+
+    // stop the rescan task
+    if let Some(handle) = rescan_handle {
+        handle.abort();
+    }
 
     let was_cancelled = cancel.load(Ordering::Relaxed);
     if was_cancelled {

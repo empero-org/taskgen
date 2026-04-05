@@ -7,9 +7,16 @@ A fast, concurrent SFT (Supervised Fine-Tuning) task generator for distillation 
 - 45+ domains, 200+ subdomains across 6 categories
 - Weighted difficulty sampling (1–10 scale)
 - Configurable category distribution
-- Concurrent generation with N workers
+- Concurrent generation with lock-free atomic stats and pre-sampled task batches
+- Live progress bar with speed, token count, and error tracking
 - OpenAI-compatible API (works with OpenAI, Together, Mistral, local vLLM, etc.)
-- JSONL output with metadata per task
+- Free model discovery via OpenRouter with automatic health checks and periodic rescanning
+- Proxy support with round-robin or sticky rotation
+- Multiple API key rotation for load balancing across routers
+- Post-run deduplication (exact + semantic similarity via word-trigram Jaccard)
+- Graceful shutdown on API outages (5+ timeouts) or billing errors
+- Automatic retry with exponential backoff on rate limits (429)
+- JSONL output with metadata per task, flushed to disk after each write
 - Optional budget cap with per-token cost tracking
 - Append mode to resume interrupted runs
 - Auto-generated dataset README on completion
@@ -34,7 +41,7 @@ taskgen [OPTIONS]
 
 | Flag | Env | Description |
 |---|---|---|
-| `--api-key <KEY>` | `OPENAI_API_KEY` | API key for the target provider |
+| `--api-key <KEY>` | `OPENAI_API_KEY` | API key for the target provider (not needed if using `--keyfile`) |
 
 ### Options
 
@@ -49,16 +56,70 @@ taskgen [OPTIONS]
 | `--append` | — | Append to existing output file |
 | `--distribution <STR>` | balanced | Category weights (see below) |
 | `--difficulty <STR>` | bell curve | Difficulty weights (see below) |
+| `--system-prompt <STR>` | built-in | Override the system prompt |
 | `--input-price <F>` | — | Input token price per 1M tokens (for cost tracking) |
 | `--output-price <F>` | — | Output token price per 1M tokens |
 | `--budget <F>` | — | Hard cost cap in USD (requires price flags) |
-| `--system-prompt <STR>` | built-in | Override the system prompt |
+
+### Proxy & Key Rotation
+
+| Flag | Default | Description |
+|---|---|---|
+| `--proxies <FILE>` | — | Proxy list file, one per line: `host:port` or `host:port:user:pass` |
+| `--rotating-proxy` | — | Use a single random proxy for all requests (sticky mode) |
+| `--keyfile <FILE>` | — | API key file, one key per line, rotated round-robin |
+
+### Free Models (OpenRouter)
+
+| Flag | Default | Description |
+|---|---|---|
+| `--free-models` | — | Auto-discover and use free models from OpenRouter |
+| `--free-rescan <MIN>` | `10` | Rescan interval in minutes for free model availability |
+
+When `--free-models` is set, taskgen will:
+1. Override `--api-base` to `https://openrouter.ai/api/v1`
+2. Fetch all available models and filter for free, text-capable models with 16k+ context
+3. Health-check each candidate with a test request (429 = live, 502/timeout = offline)
+4. Rotate verified models round-robin across tasks
+5. Track per-model failures — if a model errors 3+ times, it triggers an immediate rescan
+6. Periodically rescan on `--free-rescan` interval to pick up newly available models
+
+Each task records the actual model name in the `taskgen_model` metadata field.
+
+### Deduplication
+
+| Flag | Default | Description |
+|---|---|---|
+| `--dedup` | — | Run deduplication after generation |
+| `--dedup-threshold <F>` | `0.6` | Semantic similarity threshold (0.0–1.0) |
+
+Two-pass dedup:
+1. **Exact match** — normalized (lowercase, whitespace-collapsed) string comparison
+2. **Semantic match** — word-trigram Jaccard similarity, removes entries above the threshold
+
+### Error Handling
+
+- **429 Rate Limits** — exponential backoff with up to 5 retries, respects `Retry-After` header
+- **Billing Errors** (402, `insufficient_quota`, etc.) — immediate graceful shutdown
+- **Timeouts** — retries with backoff; 5 consecutive timeouts trigger graceful shutdown
+- **Graceful Shutdown** — all workers drain, completed tasks are saved, dedup runs if enabled, dataset README is written
 
 ## Examples
 
 **Basic — generate 500 tasks with GPT-4o-mini:**
 ```bash
 taskgen --api-key $OPENAI_API_KEY -c 500
+```
+
+**Free models via OpenRouter (no cost):**
+```bash
+taskgen --free-models --api-key $OPENROUTER_KEY -c 5000 -w 10
+```
+
+**Free models with faster rescan and dedup:**
+```bash
+taskgen --free-models --api-key $OPENROUTER_KEY -c 10000 -w 20 \
+  --free-rescan 5 --dedup --dedup-threshold 0.5
 ```
 
 **Local vLLM / Ollama:**
@@ -75,6 +136,15 @@ taskgen \
   -c 2000 -w 20 \
   --input-price 0.20 --output-price 0.20 \
   --budget 1.00
+```
+
+**With proxies and multiple API keys:**
+```bash
+taskgen \
+  --api-key none \
+  --keyfile keys.txt \
+  --proxies proxies.txt \
+  -c 5000 -w 20
 ```
 
 **Custom distribution — 50% coding, 30% math, 20% science:**
