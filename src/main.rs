@@ -1,8 +1,9 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use anyhow::{Context, Result, bail};
 use chrono::Local;
@@ -12,10 +13,10 @@ use rand::distributions::WeightedIndex;
 use rand::prelude::*;
 use serde::{Deserialize, Serialize};
 
-const DEFAULT_SYSTEM_PROMPT: &str = r#"You are a task generator for SFT (Supervised Fine-Tuning) distillation datasets. Given a domain and difficulty level, generate a single, self-contained prompt/task that a language model would be expected to respond to.
+const DEFAULT_SYSTEM_PROMPT: &str = r#"You are a task generator for SFT (Supervised Fine-Tuning) distillation datasets. Given a domain, subdomain, and difficulty level, generate a single, self-contained prompt/task that a language model would be expected to respond to.
 
 Rules:
-- The task must be specific to the given domain and subdomain.
+- The task MUST be directly and specifically about the given subdomain. The subdomain must be the central focus of the task, not just the broader domain category.
 - The difficulty must match the requested level (1-10 scale where 1=basic child-level, 10=polymath/genius expert).
 - Output ONLY the task prompt itself, nothing else. No preamble, no explanation, no labels.
 - The task should be realistic and useful for training purposes.
@@ -23,7 +24,8 @@ Rules:
 - For math tasks, the problem should be solvable and well-defined.
 - For science tasks, be precise about the subfield and concept.
 - For creative writing, provide a rich, evocative prompt.
-- For conversation tasks, set up a realistic conversational scenario."#;
+- For conversation tasks, set up a realistic conversational scenario.
+- CRITICAL: If the subdomain is "electromagnetism", the task must be about electromagnetism specifically, not general mechanics or optics. If the subdomain is "sorting", the task must involve sorting algorithms, not graph traversal. This strict alignment applies to ALL subdomains."#;
 
 const DONATION_BTC: &str = "bc1qx6zepu6sfkvshgdmc4ewu6pk6rpadvpgffpp7v";
 const DONATION_LTC: &str = "ltc1qv2mefzps2vtjcpwfx8xxdrpplrcvltswm68r7x";
@@ -126,7 +128,7 @@ fn difficulty_label(d: u8) -> &'static str {
 }
 
 #[derive(Parser, Debug, Clone)]
-#[command(name = "taskgen", version, about = "SFT task generator for distillation datasets by empero-ai")]
+#[command(name = "taskgen", version, about = "SFT task generator for distillation datasets by empero-org")]
 struct Args {
     #[arg(long, default_value = "https://api.openai.com/v1")]
     api_base: String,
@@ -160,6 +162,12 @@ struct Args {
 
     #[arg(long)]
     append: bool,
+
+    #[arg(long)]
+    proxies: Option<PathBuf>,
+
+    #[arg(long)]
+    rotating_proxy: bool,
 
     #[arg(long)]
     input_price: Option<f64>,
@@ -263,6 +271,47 @@ fn parse_difficulty(input: &str) -> Result<HashMap<u8, f64>> {
     Ok(normalized)
 }
 
+fn parse_proxy_line(line: &str) -> Result<reqwest::Proxy> {
+    let line = line.trim();
+    let parts: Vec<&str> = line.split(':').collect();
+    let proxy_url = match parts.len() {
+        2 => format!("http://{}:{}", parts[0], parts[1]),
+        4 => format!("http://{}:{}@{}:{}", parts[2], parts[3], parts[0], parts[1]),
+        _ => bail!("invalid proxy format '{}', expected host:port or host:port:user:pass", line),
+    };
+    reqwest::Proxy::all(&proxy_url).context(format!("failed to create proxy from '{}'", line))
+}
+
+fn load_proxies(path: &PathBuf) -> Result<Vec<reqwest::Proxy>> {
+    let file = File::open(path).context(format!("failed to open proxy file: {}", path.display()))?;
+    let reader = BufReader::new(file);
+    let mut proxies = Vec::new();
+    for (i, line) in reader.lines().enumerate() {
+        let line = line.context("failed to read proxy file")?;
+        let line = line.trim().to_string();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        proxies.push(parse_proxy_line(&line).context(format!("proxy line {}", i + 1))?);
+    }
+    if proxies.is_empty() {
+        bail!("proxy file is empty: {}", path.display());
+    }
+    Ok(proxies)
+}
+
+fn build_clients(proxies: &[reqwest::Proxy]) -> Vec<reqwest::Client> {
+    proxies
+        .iter()
+        .map(|p| {
+            reqwest::Client::builder()
+                .proxy(p.clone())
+                .build()
+                .expect("failed to build client with proxy")
+        })
+        .collect()
+}
+
 fn build_domain_pool(dist: &HashMap<String, f64>) -> Vec<(String, String, String, f64)> {
     let mut pool = Vec::new();
     for (cat, &weight) in dist {
@@ -303,12 +352,14 @@ async fn generate_task(
     system_prompt: &str,
     category: &str,
     domain_display: &str,
+    subdomain: &str,
     difficulty: u8,
     temperature: f64,
 ) -> Result<(String, u64, u64)> {
     let user_msg = format!(
-        "Generate a task/prompt for the following:\n\nDomain: {}\nDifficulty: {}/10 ({})\n\nOutput only the task prompt, nothing else.",
-        domain_display, difficulty, difficulty_label(difficulty)
+        "Generate a task/prompt for the following:\n\nDomain: {}\nSubdomain: {}\nDifficulty: {}/10 ({})\n\nThe task MUST be directly and specifically about the subdomain \"{}\" within {}. Do NOT generate a generic {} task — the content must focus on {} specifically.\n\nOutput only the task prompt, nothing else.",
+        domain_display, subdomain, difficulty, difficulty_label(difficulty),
+        subdomain, domain_display, domain_display, subdomain
     );
 
     let body = ChatRequest {
@@ -376,7 +427,7 @@ fn generate_readme(
     let mut md = String::new();
 
     md.push_str("# TaskGen Dataset\n\n");
-    md.push_str("> Generated with **taskgen** by [empero-ai](https://github.com/empero-ai)\n\n");
+    md.push_str("> Generated with **taskgen** by [empero-org](https://github.com/empero-org)\n\n");
 
     md.push_str("## Run Parameters\n\n");
     md.push_str("| Parameter | Value |\n|---|---|\n");
@@ -449,7 +500,7 @@ fn generate_readme(
     md.push_str(&format!("- **XMR**: `{}`\n\n", DONATION_XMR));
 
     md.push_str("---\n\n");
-    md.push_str("*Built with [taskgen](https://github.com/empero-ai/taskgen) by empero-ai*\n");
+    md.push_str("*Built with [taskgen](https://github.com/empero-org/taskgen) by empero-org*\n");
 
     md
 }
@@ -488,7 +539,25 @@ async fn main() -> Result<()> {
         File::create(&args.output)?
     };
 
-    let client = Arc::new(reqwest::Client::new());
+    let clients: Arc<Vec<reqwest::Client>> = Arc::new(match &args.proxies {
+        Some(proxy_path) => {
+            let proxies = load_proxies(proxy_path)?;
+            let total = proxies.len();
+            if args.rotating_proxy {
+                let idx = thread_rng().gen_range(0..total);
+                println!("Using rotating proxy (sticky): proxy #{}", idx + 1);
+                vec![reqwest::Client::builder()
+                    .proxy(proxies.into_iter().nth(idx).unwrap())
+                    .build()?]
+            } else {
+                println!("Loaded {} proxies (round-robin)", total);
+                build_clients(&proxies)
+            }
+        }
+        None => vec![reqwest::Client::new()],
+    });
+    let proxy_counter = Arc::new(AtomicUsize::new(0));
+
     let file = Arc::new(std::sync::Mutex::new(file));
     let stats = Arc::new(std::sync::Mutex::new(RunStats {
         total_input_tokens: 0,
@@ -508,7 +577,8 @@ async fn main() -> Result<()> {
 
     let results: Vec<_> = stream::iter(0..count)
         .map(|i| {
-            let client = client.clone();
+            let clients = clients.clone();
+            let proxy_counter = proxy_counter.clone();
             let file = file.clone();
             let stats = stats.clone();
             let api_base = args.api_base.clone();
@@ -539,21 +609,30 @@ async fn main() -> Result<()> {
                 }
 
                 let domain_display = format!("{}::{}", cat, domain_name);
+                let client_idx = proxy_counter.fetch_add(1, Ordering::Relaxed) % clients.len();
+                let client = &clients[client_idx];
 
                 match generate_task(
-                    &client,
+                    client,
                     &api_base,
                     &api_key,
                     &model,
                     &system_prompt,
                     &cat,
                     &domain_display,
+                    &subdomain,
                     difficulty,
                     temperature,
                 )
                 .await
                 {
                     Ok((prompt, in_tok, out_tok)) => {
+                        if prompt.trim().is_empty() {
+                            eprintln!("[WARN] task {}: empty prompt, skipping", i + 1);
+                            let mut s = stats.lock().unwrap();
+                            s.errors += 1;
+                            return;
+                        }
                         let entry = TaskEntry {
                             prompt,
                             domain: format!("{}::{}", cat, domain_name),
@@ -595,6 +674,37 @@ async fn main() -> Result<()> {
     let stats = stats.lock().unwrap();
     println!("\nDone! Generated {} tasks ({} errors)", stats.total_tasks, stats.errors);
     println!("Tokens: {} in / {} out", stats.total_input_tokens, stats.total_output_tokens);
+
+    // Deduplicate output file
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut deduped_lines: Vec<String> = Vec::new();
+    let mut duplicates: usize = 0;
+
+    if args.output.exists() {
+        let reader = BufReader::new(File::open(&args.output)?);
+        for line in reader.lines().flatten() {
+            if let Ok(entry) = serde_json::from_str::<TaskEntry>(&line) {
+                let normalized = entry.prompt.to_lowercase();
+                let normalized: String = normalized.split_whitespace().collect();
+                if seen.insert(normalized) {
+                    deduped_lines.push(line);
+                } else {
+                    duplicates += 1;
+                }
+            } else {
+                deduped_lines.push(line);
+            }
+        }
+    }
+
+    if duplicates > 0 {
+        let mut f = File::create(&args.output)?;
+        for line in &deduped_lines {
+            f.write_all(line.as_bytes())?;
+            f.write_all(b"\n")?;
+        }
+        println!("Deduplicated: removed {} duplicate prompts ({} remaining)", duplicates, deduped_lines.len());
+    }
 
     let readme = generate_readme(&args, &stats, &dist, &diff_dist);
     let readme_path = args.output.parent().unwrap_or(std::path::Path::new(".")).join("README.md");
