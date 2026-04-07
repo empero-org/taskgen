@@ -56,6 +56,7 @@ taskgen [OPTIONS]
 | `--append` | — | Append to existing output file |
 | `--distribution <STR>` | balanced | Category weights (see below) |
 | `--difficulty <STR>` | bell curve | Difficulty weights (see below) |
+| `--multilingual` | — | Generate tasks in 8 languages and split output by language |
 | `--system-prompt <STR>` | built-in | Override the system prompt |
 | `--input-price <F>` | — | Input token price per 1M tokens (for cost tracking) |
 | `--output-price <F>` | — | Output token price per 1M tokens |
@@ -85,6 +86,32 @@ When `--free-models` is set, taskgen will:
 6. Periodically rescan on `--free-rescan` interval to pick up newly available models
 
 Each task records the actual model name in the `taskgen_model` metadata field.
+
+### Multilingual
+
+When `--multilingual` is set, each task is randomly assigned one of 8 languages:
+
+| Code | Language |
+|---|---|
+| `en` | English |
+| `de` | German |
+| `fr` | French |
+| `es` | Spanish |
+| `nl` | Dutch |
+| `zh` | Chinese |
+| `ar` | Arabic |
+| `ru` | Russian |
+
+The LLM is instructed to write the task in the assigned language. A `"language"` field is added to each JSON entry's metadata. After generation (and dedup if enabled), the output is split into per-language files:
+
+```
+output_en.jsonl
+output_de.jsonl
+output_fr.jsonl
+...
+```
+
+The generated dataset README includes a language distribution table with per-language task counts.
 
 ### Deduplication
 
@@ -120,6 +147,11 @@ taskgen --free-models --api-key $OPENROUTER_KEY -c 5000 -w 10
 ```bash
 taskgen --free-models --api-key $OPENROUTER_KEY -c 10000 -w 20 \
   --free-rescan 5 --dedup --dedup-threshold 0.5
+```
+
+**Multilingual dataset — tasks in 8 languages:**
+```bash
+taskgen --api-key $OPENAI_API_KEY -c 2000 -w 10 --multilingual --dedup
 ```
 
 **Local vLLM / Ollama:**
@@ -172,10 +204,13 @@ Each line in the JSONL file is a self-contained task record:
   "domain": "math::Number Theory",
   "subdomain": "primes",
   "difficulty": 4,
+  "language": "en",
   "taskgen_model": "gpt-4o-mini",
   "temperature": 0.9
 }
 ```
+
+The `language` field is only present when `--multilingual` is used.
 
 A `README.md` summarising run parameters, token usage, and cost is written alongside the output file on completion.
 

@@ -811,6 +811,7 @@ fn generate_readme(
     stats: &RunStats,
     dist: &HashMap<String, f64>,
     diff_dist: &HashMap<u8, f64>,
+    lang_counts: Option<&HashMap<String, usize>>,
 ) -> String {
     let input_cost = args.input_price.map(|p| p * stats.total_input_tokens as f64 / 1_000_000.0);
     let output_cost = args.output_price.map(|p| p * stats.total_output_tokens as f64 / 1_000_000.0);
@@ -835,7 +836,22 @@ fn generate_readme(
     if let Some(b) = args.budget {
         md.push_str(&format!("| Budget Cap | ${:.4} |\n", b));
     }
+    if args.multilingual {
+        md.push_str("| Multilingual | Yes (en, de, fr, es, nl, zh, ar, ru) |\n");
+    }
     md.push('\n');
+
+    if let Some(counts) = lang_counts {
+        md.push_str("## Language Distribution\n\n");
+        md.push_str("| Language | Code | Tasks |\n|---|---|---|\n");
+        let mut sorted: Vec<_> = counts.iter().collect();
+        sorted.sort_by(|a, b| b.1.cmp(a.1));
+        for (code, count) in &sorted {
+            let name = LANGUAGES.iter().find(|(c, _)| *c == code.as_str()).map(|(_, n)| *n).unwrap_or("Unknown");
+            md.push_str(&format!("| {} | `{}` | {} |\n", name, code, count));
+        }
+        md.push('\n');
+    }
 
     md.push_str("## Domain Distribution\n\n");
     md.push_str("| Domain | Weight |\n|---|---|\n");
@@ -883,6 +899,9 @@ fn generate_readme(
     md.push_str("  \"domain\": \"math::Algebra\",\n");
     md.push_str("  \"subdomain\": \"polynomials\",\n");
     md.push_str("  \"difficulty\": 5,\n");
+    if args.multilingual {
+        md.push_str("  \"language\": \"en\",\n");
+    }
     md.push_str("  \"taskgen_model\": \"gpt-4o-mini\",\n");
     md.push_str("  \"temperature\": 0.9\n");
     md.push_str("}\n");
@@ -1306,7 +1325,7 @@ async fn main() -> Result<()> {
     }
 
     // split output into per-language files when --multilingual is set
-    if multilingual && args.output.exists() {
+    let lang_counts: Option<HashMap<String, usize>> = if multilingual && args.output.exists() {
         println!("\nSplitting output by language...");
         let reader = BufReader::new(File::open(&args.output)?);
         let mut lang_buckets: HashMap<String, Vec<String>> = HashMap::new();
@@ -1323,6 +1342,8 @@ async fn main() -> Result<()> {
         let stem = args.output.file_stem().unwrap_or_default().to_string_lossy();
         let ext = args.output.extension().map(|e| format!(".{}", e.to_string_lossy())).unwrap_or_default();
 
+        let counts: HashMap<String, usize> = lang_buckets.iter().map(|(k, v)| (k.clone(), v.len())).collect();
+
         for (lang, lines) in &lang_buckets {
             let lang_path = out_dir.join(format!("{}_{}{}", stem, lang, ext));
             let mut f = File::create(&lang_path)?;
@@ -1332,9 +1353,13 @@ async fn main() -> Result<()> {
             }
             println!("  {} — {} tasks -> {}", lang, lines.len(), lang_path.display());
         }
-    }
 
-    let readme = generate_readme(&args, &stats, &dist, &diff_dist);
+        Some(counts)
+    } else {
+        None
+    };
+
+    let readme = generate_readme(&args, &stats, &dist, &diff_dist, lang_counts.as_ref());
     let readme_path = args.output.parent().unwrap_or(std::path::Path::new(".")).join("README.md");
     let mut rf = File::create(&readme_path).context("failed to create README.md")?;
     rf.write_all(readme.as_bytes())?;
