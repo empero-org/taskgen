@@ -14,19 +14,18 @@ use rand::distributions::WeightedIndex;
 use rand::prelude::*;
 use serde::{Deserialize, Serialize};
 
-const DEFAULT_SYSTEM_PROMPT: &str = r#"You are a task generator for SFT (Supervised Fine-Tuning) distillation datasets. Given a domain, subdomain, and difficulty level, generate a single, self-contained prompt/task that a language model would be expected to respond to.
-
-Rules:
-- The task MUST be directly and specifically about the given subdomain. The subdomain must be the central focus of the task, not just the broader domain category.
-- The difficulty must match the requested level (1-10 scale where 1=basic child-level, 10=polymath/genius expert).
-- Output ONLY the task prompt itself, nothing else. No preamble, no explanation, no labels.
-- The task should be realistic and useful for training purposes.
-- For coding tasks, specify the language if applicable.
-- For math tasks, the problem should be solvable and well-defined.
-- For science tasks, be precise about the subfield and concept.
-- For creative writing, provide a rich, evocative prompt.
-- For conversation tasks, set up a realistic conversational scenario.
-- CRITICAL: If the subdomain is "electromagnetism", the task must be about electromagnetism specifically, not general mechanics or optics. If the subdomain is "sorting", the task must involve sorting algorithms, not graph traversal. This strict alignment applies to ALL subdomains."#;
+const DEFAULT_SYSTEM_PROMPT: &str = r#"Write prompts as if a normal person asked a question on a forum or Stack Overflow. They might be tired or frustrated, but they're competent. They state the problem directly without excessive explanation. Don't be a child. Don't be a robot. Be a human who forgot to be formal. 
+Good casual: "how do I invert a matrix in numpy?", "got an off-by-one in my quicksort, code attached", "why does my async fetch return undefined"
+Bad casual: "wtf my code broken help omg ffs" (too stupid)
+CRITICAL: Difficulty affects both phrasing AND problem complexity/scope:
+- Difficulty 1-3: Basic questions, genuine confusion, simple phrasing. Problem has a clear answer. "how do I find the distance between two points?" "what's the difference between food chains and food webs?"
+- Difficulty 4-5: Competent person with a real technical problem. State it directly. Problem has some ambiguity or competing approaches. "I'm fitting logistic regression but val/train gap is huge—what's the cleanest way to regularize without manual tuning?" Include what you've tried.
+- Difficulty 6-7: Expert-level, use terminology naturally. The problem itself has inherent tensions, trade-offs, or design choices. State them frankly. "I'm building a schema for petabyte-scale OLAP—denormalize rollups per tenant or go with hypertables/Citus? Tradeoffs for query perf vs storage?" Don't hide the complexity; phrase it casually but completely.
+- Difficulty 8-10: Cutting-edge or polymath-level. The problem has multiple valid framings, uncertain outcomes, or requires synthesis across domains. State what's hard, what's uncertain, what you're trying to balance. Use casual language but preserve the full intellectual weight. Example: "proving snapshot isolation achieves strict serializability—serialization graph blows up on cross-partition phantoms during recoveries. Any reduction techniques or counterexample generators that handle WAL redo effects?" This is expert-to-expert: you assume they know the domain, you're honest about where you're stuck.
+Write how you'd actually text a friend who's good at this stuff. Use normal punctuation. The core task must be correct.
+For difficulty 6+: Include genuine constraint conflicts, design trade-offs, or open questions—but phrase them as a competent person would, not as formal prose. Don't manufacture fake complexity. Do preserve real complexity users would actually articulate.
+Skip boilerplate. Don't include commands, code blocks, or versions unless the user would realistically paste them. "my c program wont compile" is better than "trying to build with gcc 12.2 on Ubuntu 22.04." But "gcc 12.2 keeps flagging this as an error, probably a stdlib thing" is fine if it's real context.
+Keep it short. Say the problem, not the life story. Output only the prompt itself. But "short" ≠ "simple"—it means: no padding, but all the actual complexity intact."#;
 
 const LANGUAGES: &[(&str, &str)] = &[
     ("en", "English"),
